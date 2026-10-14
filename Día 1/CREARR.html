@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Tassels Only por semana</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 24px; }
+  label { display: inline-block; margin: 6px 16px 6px 0; }
+  input, select, button { padding: 4px; }
+  table { border-collapse: collapse; margin-top: 16px; }
+  th, td { border: 1px solid #999; padding: 4px 10px; text-align: right; }
+  th { background: #ffff00; }
+  td:first-child, td:nth-child(2) { text-align: left; }
+  #estado { margin-top: 12px; color: #444; }
+</style>
+</head>
+<body>
+<h2>Tassels Only por semana</h2>
+
+<label>Archivo CSV: <input type="file" id="archivo" accept=".csv"></label><br>
+<label>Columna de fecha: <input id="colFecha" value="IMPORTED"></label>
+<label>Columna de tipo: <input id="colTipo" value="ASSIGNMENT TYPE"></label><br>
+<label>Lunes de la Semana 1: <input type="date" id="inicio" value="2025-06-30"></label>
+<label>Formato de fecha:
+  <select id="fmt">
+    <option value="MDY">Mes/Día/Año (11/10/2025 = 10 nov)</option>
+    <option value="DMY">Día/Mes/Año (11/10/2025 = 11 oct)</option>
+  </select>
+</label><br>
+<button id="go">Procesar</button>
+<button id="copiar" disabled>Copiar tabla (para pegar en Excel)</button>
+
+<div id="estado"></div>
+<div id="salida"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let tsv = "";
+
+function parseFecha(v, fmt) {
+  v = v.trim();
+  if (!v) return null;
+  let y, mo, d, m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else {
+    m = v.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+    if (!m) return null;
+    const a = +m[1], b = +m[2];
+    y = +m[3]; if (y < 100) y += 2000;
+    if (fmt === "MDY") { mo = a; d = b; } else { d = a; mo = b; }
+  }
+  return Date.UTC(y, mo - 1, d);
+}
+
+function num(v) {
+  const n = parseFloat(String(v).replace(/,/g, ""));
+  return isNaN(n) ? 0 : n;
+}
+
+async function procesar() {
+  const file = $("archivo").files[0];
+  if (!file) { alert("Selecciona el archivo CSV"); return; }
+
+  const COL_FECHA = $("colFecha").value.trim().toUpperCase();
+  const COL_TIPO = $("colTipo").value.trim().toUpperCase();
+  const fmt = $("fmt").value;
+  const inicio = Date.parse($("inicio").value);   // UTC medianoche
+  const DIA = 86400000;
+
+  let iFecha = -1, iTipo = -1, iTassel = -1, iMascot = -1, iOtros = [];
+  let header = null;
+  const datos = new Map();   // semana -> Map(tipo -> {to, filas})
+  const tipos = new Set();
+  let filas = 0, fechasMalas = 0, antesDeInicio = 0;
+
+  function emitir(row) {
+    if (row.length === 1 && row[0] === "") return;
+    if (!header) {
+      header = row.map(c => c.replace(/^\uFEFF/, "").trim().toUpperCase());
+      iFecha = header.indexOf(COL_FECHA);
+      iTipo = header.indexOf(COL_TIPO);
+      iTassel = header.indexOf("TASSEL QTY");
+      iMascot = header.indexOf("MASCOT MEDAL QTY");
+      header.forEach((c, i) => {
+        if (c.endsWith(" QTY") && i !== iTassel && i !== iMascot) iOtros.push(i);
+      });
+      if (iFecha < 0 || iTipo < 0 || iTassel < 0 || iMascot < 0) {
+        throw new Error("No encontré alguna columna. Encabezados detectados: " + header.join(" | "));
+      }
+      return;
+    }
+    filas++;
+    const t = parseFecha(row[iFecha] || "", fmt);
+    if (t === null) { fechasMalas++; return; }
+    const dias = Math.floor((t - inicio) / DIA);
+    if (dias < 0) { antesDeInicio++; return; }
+    const semana = Math.floor(dias / 7) + 1;
+    const tipo = (row[iTipo] || "").trim() || "(vacío)";
+    tipos.add(tipo);
+
+    const tm = num(row[iTassel]) + num(row[iMascot]);
+    let otros = 0;
+    for (const i of iOtros) otros += num(row[i]);
+    const esTO = (tm > 0 && otros === 0) ? 1 : 0;
+
+    if (!datos.has(semana)) datos.set(semana, new Map());
+    const mt = datos.get(semana);
+    if (!mt.has(tipo)) mt.set(tipo, { to: 0, filas: 0 });
+    const o = mt.get(tipo);
+    o.to += esTO; o.filas++;
+  }
+
+  $("go").disabled = true;
+  $("estado").textContent = "Procesando...";
+  $("salida").innerHTML = "";
+
+  try {
+    const reader = file.stream().getReader();
+    const dec = new TextDecoder("utf-8");
+    let delim = null, field = "", row = [], inQ = false, pend = false;
+    let leidos = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      let s = done ? "" : dec.decode(value, { stream: true });
+      if (!done) leidos += value.length;
+
+      if (delim === null && s) {
+        const primera = s.split("\n")[0];
+        const c = (primera.match(/,/g) || []).length;
+        const p = (primera.match(/;/g) || []).length;
+        delim = p > c ? ";" : ",";
+      }
+
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (pend) {
+          pend = false;
+          if (ch === '"') { field += '"'; continue; }
+          inQ = false;
+        }
+        if (inQ) {
+          if (ch === '"') pend = true; else field += ch;
+          continue;
+        }
+        if (ch === '"') inQ = true;
+        else if (ch === delim) { row.push(field); field = ""; }
+        else if (ch === "\n") { row.push(field); field = ""; emitir(row); row = []; }
+        else if (ch !== "\r") field += ch;
+      }
+
+      $("estado").textContent = "Procesando... " + (leidos / 1048576).toFixed(0) +
+        " MB de " + (file.size / 1048576).toFixed(0) + " MB (" + filas.toLocaleString() + " filas)";
+      if (done) break;
+    }
+    if (field !== "" || row.length) { row.push(field); emitir(row); }
+  } catch (e) {
+    $("estado").textContent = "Error: " + e.message;
+    $("go").disabled = false;
+    return;
+  }
+
+  // Construir tabla
+  const listaTipos = [...tipos].sort();
+  const semanas = [...datos.keys()].sort((a, b) => a - b);
+  const enc = ["Semana", "Inicio (lunes)"];
+  listaTipos.forEach(t => enc.push(t + " Tassels Only"));
+  enc.push("Total Tassels Only", "Órdenes totales");
+
+  const lineas = [enc];
+  for (const w of semanas) {
+    const mt = datos.get(w);
+    const lunes = new Date(inicio + (w - 1) * 7 * DIA).toISOString().slice(0, 10);
+    const r = ["Semana " + w, lunes];
+    let tot = 0, ord = 0;
+    for (const t of listaTipos) {
+      const o = mt.get(t) || { to: 0, filas: 0 };
+      r.push(o.to); tot += o.to; ord += o.filas;
+    }
+    r.push(tot, ord);
+    lineas.push(r);
+  }
+
+  tsv = lineas.map(l => l.join("\t")).join("\n");
+  let html = "<table><tr>" + enc.map(h => "<th>" + h + "</th>").join("") + "</tr>";
+  for (let i = 1; i < lineas.length; i++) {
+    html += "<tr>" + lineas[i].map(c => "<td>" + c + "</td>").join("") + "</tr>";
+  }
+  $("salida").innerHTML = html + "</table>";
+  $("estado").textContent = "Listo. Filas leídas: " + filas.toLocaleString() +
+    " | Fechas no reconocidas: " + fechasMalas.toLocaleString() +
+    " | Anteriores al inicio: " + antesDeInicio.toLocaleString();
+  $("copiar").disabled = false;
+  $("go").disabled = false;
+}
+
+$("go").onclick = procesar;
+$("copiar").onclick = async () => {
+  await navigator.clipboard.writeText(tsv);
+  $("estado").textContent += " | Tabla copiada, pégala en Excel.";
+};
+</script>
+</body>
+</html>
