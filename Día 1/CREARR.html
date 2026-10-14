@@ -12,8 +12,10 @@
   th { background: #ffff00; }
   td:first-child, td:nth-child(2) { text-align: left; }
   tr.total td { font-weight: bold; background: #e8e8e8; }
-  #estado, #concilia { margin-top: 12px; color: #444; }
+  #estado, #concilia, #cols { margin-top: 12px; color: #444; }
   #concilia { font-weight: bold; }
+  #cols { font-size: 13px; line-height: 1.5; }
+  #detalle td { text-align: left; }
 </style>
 </head>
 <body>
@@ -29,13 +31,16 @@
     <option value="DMY">Día/Mes/Año (11/10/2025 = 11 oct)</option>
   </select>
 </label><br>
-<label><input type="checkbox" id="incluirCeros"> Incluir filas con tassel y mascot en 0 (como el filtro manual: solo los demás productos en 0)</label><br>
+<label><input type="checkbox" id="incluirCeros"> Incluir filas con tassel y mascot en 0 (solo los demás productos en 0)</label><br>
+<label>Depurar semana (número, opcional): <input id="depSemana" size="4"></label><br>
 <button id="go">Procesar</button>
 <button id="copiar" disabled>Copiar tabla (para pegar en Excel)</button>
 
 <div id="estado"></div>
 <div id="concilia"></div>
+<div id="cols"></div>
 <div id="salida"></div>
+<div id="detalle"></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -124,6 +129,10 @@ async function procesar() {
   const fmt = $("fmt").value;
   inicio = Date.parse($("inicio").value);
 
+  const dep = $("depSemana").value.trim();
+  const detalle = [];
+  const LIMITE_DETALLE = 3000;
+
   let iFecha = -1, iTipo = -1, iTassel = -1, iMascot = -1, iOtros = [];
   let header = null;
   datos = new Map();
@@ -132,6 +141,7 @@ async function procesar() {
 
   function emitir(row) {
     if (row.length === 1 && row[0] === "") return;
+
     if (!header) {
       header = row.map(c => c.replace(/^\uFEFF/, "").trim().toUpperCase());
       iFecha = header.indexOf(COL_FECHA);
@@ -144,11 +154,17 @@ async function procesar() {
       if (iFecha < 0 || iTipo < 0 || iTassel < 0 || iMascot < 0) {
         throw new Error("No encontré alguna columna. Encabezados detectados: " + header.join(" | "));
       }
+      $("cols").innerHTML =
+        "<b>Tomadas como otros productos (" + iOtros.length + "):</b> " +
+        iOtros.map(i => header[i]).join(", ") +
+        "<br><b>NO tomadas (revisa que ninguna sea un producto):</b> " +
+        header.filter((c, i) => !iOtros.includes(i)).join(", ");
       return;
     }
+
     filas++;
 
-    // Semana: igual que la fórmula de Excel, lo anterior al inicio (o sin fecha válida) es N/A
+    // Semana: igual que la fórmula de Excel; lo anterior al inicio (o sin fecha válida) es N/A
     let semana;
     const t = parseFecha(row[iFecha], fmt);
     if (t === null) { fechasMalas++; semana = "N/A"; }
@@ -162,21 +178,36 @@ async function procesar() {
     tipos.add(tipo);
 
     const tm = num(row[iTassel]) + num(row[iMascot]);
-    let otros = 0;
-    for (const i of iOtros) otros += num(row[i]);
+    let otros = 0, hayOtros = false;
+    const conCantidad = [];
+    for (const i of iOtros) {
+      const n = num(row[i]);
+      otros += n;
+      if (n !== 0) { hayOtros = true; conCantidad.push(header[i] + "=" + n); }
+    }
+
+    if (dep !== "" && String(semana) === dep && detalle.length < LIMITE_DETALLE) {
+      detalle.push([
+        filas + 1, row[iFecha], tipo, num(row[iTassel]), num(row[iMascot]),
+        hayOtros ? "NO" : (tm > 0 ? "SÍ" : "todo en 0"),
+        conCantidad.join(", ")
+      ]);
+    }
 
     if (!datos.has(semana)) datos.set(semana, new Map());
     const mt = datos.get(semana);
     if (!mt.has(tipo)) mt.set(tipo, { to: 0, ceros: 0, filas: 0 });
     const o = mt.get(tipo);
     o.filas++;
-    if (otros === 0) { if (tm > 0) o.to++; else o.ceros++; }
+    if (!hayOtros) { if (tm > 0) o.to++; else o.ceros++; }
   }
 
   $("go").disabled = true;
   $("estado").textContent = "Procesando...";
   $("concilia").textContent = "";
+  $("cols").textContent = "";
   $("salida").innerHTML = "";
+  $("detalle").innerHTML = "";
 
   try {
     const reader = file.stream().getReader();
@@ -225,6 +256,15 @@ async function procesar() {
   }
 
   render();
+
+  if (dep !== "") {
+    let h = "<h3>Filas de la semana " + dep + " (" + detalle.length + ")</h3>" +
+      "<table><tr><th>Fila aprox.</th><th>Fecha</th><th>Tipo</th><th>Tassel</th><th>Mascot</th>" +
+      "<th>¿Tassels only?</th><th>Otros productos con cantidad</th></tr>";
+    detalle.forEach(d => h += "<tr>" + d.map(c => "<td>" + c + "</td>").join("") + "</tr>");
+    $("detalle").innerHTML = h + "</table>";
+  }
+
   $("estado").textContent = "Listo. Filas leídas: " + filas.toLocaleString() +
     " | En N/A: " + (antesDeInicio + fechasMalas).toLocaleString() +
     " (anteriores al inicio: " + antesDeInicio.toLocaleString() +
