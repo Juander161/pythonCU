@@ -11,7 +11,9 @@
   th, td { border: 1px solid #999; padding: 4px 10px; text-align: right; }
   th { background: #ffff00; }
   td:first-child, td:nth-child(2) { text-align: left; }
-  #estado { margin-top: 12px; color: #444; }
+  tr.total td { font-weight: bold; background: #e8e8e8; }
+  #estado, #concilia { margin-top: 12px; color: #444; }
+  #concilia { font-weight: bold; }
 </style>
 </head>
 <body>
@@ -27,18 +29,24 @@
     <option value="DMY">Día/Mes/Año (11/10/2025 = 11 oct)</option>
   </select>
 </label><br>
+<label><input type="checkbox" id="incluirCeros"> Incluir filas con tassel y mascot en 0 (como el filtro manual: solo los demás productos en 0)</label><br>
 <button id="go">Procesar</button>
 <button id="copiar" disabled>Copiar tabla (para pegar en Excel)</button>
 
 <div id="estado"></div>
+<div id="concilia"></div>
 <div id="salida"></div>
 
 <script>
 const $ = id => document.getElementById(id);
+const DIA = 86400000;
 let tsv = "";
+let datos = new Map();     // semana (número o "N/A") -> Map(tipo -> {to, ceros, filas})
+let tipos = new Set();
+let inicio = 0;
 
 function parseFecha(v, fmt) {
-  v = v.trim();
+  v = (v || "").trim();
   if (!v) return null;
   let y, mo, d, m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
   if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
@@ -57,6 +65,56 @@ function num(v) {
   return isNaN(n) ? 0 : n;
 }
 
+function render() {
+  const incluir = $("incluirCeros").checked;
+  const listaTipos = [...tipos].sort();
+  const semanas = [...datos.keys()].filter(k => k !== "N/A").sort((a, b) => a - b);
+  if (datos.has("N/A")) semanas.push("N/A");
+
+  const enc = ["Semana", "Inicio (lunes)"];
+  listaTipos.forEach(t => enc.push(t + " Tassels Only"));
+  enc.push("Total Tassels Only", "Órdenes totales");
+
+  const lineas = [enc];
+  const acum = new Array(listaTipos.length + 2).fill(0);
+  let totTO = 0, totCeros = 0, totFilas = 0;
+
+  for (const w of semanas) {
+    const mt = datos.get(w);
+    const etiqueta = w === "N/A" ? "N/A" : "Semana " + w;
+    const lunes = w === "N/A" ? "-" : new Date(inicio + (w - 1) * 7 * DIA).toISOString().slice(0, 10);
+    const r = [etiqueta, lunes];
+    let tot = 0, ord = 0;
+    listaTipos.forEach((t, i) => {
+      const o = mt.get(t) || { to: 0, ceros: 0, filas: 0 };
+      const v = o.to + (incluir ? o.ceros : 0);
+      r.push(v); tot += v; ord += o.filas;
+      acum[i] += v;
+      totTO += o.to; totCeros += o.ceros; totFilas += o.filas;
+    });
+    r.push(tot, ord);
+    acum[listaTipos.length] += tot;
+    acum[listaTipos.length + 1] += ord;
+    lineas.push(r);
+  }
+  lineas.push(["TOTAL", "", ...acum]);
+
+  tsv = lineas.map(l => l.join("\t")).join("\n");
+  let html = "<table><tr>" + enc.map(h => "<th>" + h + "</th>").join("") + "</tr>";
+  for (let i = 1; i < lineas.length; i++) {
+    const esTotal = i === lineas.length - 1;
+    html += "<tr" + (esTotal ? ' class="total"' : "") + ">" +
+      lineas[i].map(c => "<td>" + c + "</td>").join("") + "</tr>";
+  }
+  $("salida").innerHTML = html + "</table>";
+
+  $("concilia").textContent =
+    "Con tassel o mascot > 0 y demás productos en 0: " + totTO.toLocaleString() +
+    " | Con todo en 0: " + totCeros.toLocaleString() +
+    " | Suma de ambos (equivale al filtro manual): " + (totTO + totCeros).toLocaleString() +
+    " | Órdenes totales del archivo: " + totFilas.toLocaleString();
+}
+
 async function procesar() {
   const file = $("archivo").files[0];
   if (!file) { alert("Selecciona el archivo CSV"); return; }
@@ -64,13 +122,12 @@ async function procesar() {
   const COL_FECHA = $("colFecha").value.trim().toUpperCase();
   const COL_TIPO = $("colTipo").value.trim().toUpperCase();
   const fmt = $("fmt").value;
-  const inicio = Date.parse($("inicio").value);   // UTC medianoche
-  const DIA = 86400000;
+  inicio = Date.parse($("inicio").value);
 
   let iFecha = -1, iTipo = -1, iTassel = -1, iMascot = -1, iOtros = [];
   let header = null;
-  const datos = new Map();   // semana -> Map(tipo -> {to, filas})
-  const tipos = new Set();
+  datos = new Map();
+  tipos = new Set();
   let filas = 0, fechasMalas = 0, antesDeInicio = 0;
 
   function emitir(row) {
@@ -90,28 +147,35 @@ async function procesar() {
       return;
     }
     filas++;
-    const t = parseFecha(row[iFecha] || "", fmt);
-    if (t === null) { fechasMalas++; return; }
-    const dias = Math.floor((t - inicio) / DIA);
-    if (dias < 0) { antesDeInicio++; return; }
-    const semana = Math.floor(dias / 7) + 1;
-    const tipo = (row[iTipo] || "").trim() || "(vacío)";
+
+    // Semana: igual que la fórmula de Excel, lo anterior al inicio (o sin fecha válida) es N/A
+    let semana;
+    const t = parseFecha(row[iFecha], fmt);
+    if (t === null) { fechasMalas++; semana = "N/A"; }
+    else {
+      const dias = Math.floor((t - inicio) / DIA);
+      if (dias < 0) { antesDeInicio++; semana = "N/A"; }
+      else semana = Math.floor(dias / 7) + 1;
+    }
+
+    const tipo = (row[iTipo] || "").trim().toUpperCase() || "(VACÍO)";
     tipos.add(tipo);
 
     const tm = num(row[iTassel]) + num(row[iMascot]);
     let otros = 0;
     for (const i of iOtros) otros += num(row[i]);
-    const esTO = (tm > 0 && otros === 0) ? 1 : 0;
 
     if (!datos.has(semana)) datos.set(semana, new Map());
     const mt = datos.get(semana);
-    if (!mt.has(tipo)) mt.set(tipo, { to: 0, filas: 0 });
+    if (!mt.has(tipo)) mt.set(tipo, { to: 0, ceros: 0, filas: 0 });
     const o = mt.get(tipo);
-    o.to += esTO; o.filas++;
+    o.filas++;
+    if (otros === 0) { if (tm > 0) o.to++; else o.ceros++; }
   }
 
   $("go").disabled = true;
   $("estado").textContent = "Procesando...";
+  $("concilia").textContent = "";
   $("salida").innerHTML = "";
 
   try {
@@ -160,41 +224,17 @@ async function procesar() {
     return;
   }
 
-  // Construir tabla
-  const listaTipos = [...tipos].sort();
-  const semanas = [...datos.keys()].sort((a, b) => a - b);
-  const enc = ["Semana", "Inicio (lunes)"];
-  listaTipos.forEach(t => enc.push(t + " Tassels Only"));
-  enc.push("Total Tassels Only", "Órdenes totales");
-
-  const lineas = [enc];
-  for (const w of semanas) {
-    const mt = datos.get(w);
-    const lunes = new Date(inicio + (w - 1) * 7 * DIA).toISOString().slice(0, 10);
-    const r = ["Semana " + w, lunes];
-    let tot = 0, ord = 0;
-    for (const t of listaTipos) {
-      const o = mt.get(t) || { to: 0, filas: 0 };
-      r.push(o.to); tot += o.to; ord += o.filas;
-    }
-    r.push(tot, ord);
-    lineas.push(r);
-  }
-
-  tsv = lineas.map(l => l.join("\t")).join("\n");
-  let html = "<table><tr>" + enc.map(h => "<th>" + h + "</th>").join("") + "</tr>";
-  for (let i = 1; i < lineas.length; i++) {
-    html += "<tr>" + lineas[i].map(c => "<td>" + c + "</td>").join("") + "</tr>";
-  }
-  $("salida").innerHTML = html + "</table>";
+  render();
   $("estado").textContent = "Listo. Filas leídas: " + filas.toLocaleString() +
-    " | Fechas no reconocidas: " + fechasMalas.toLocaleString() +
-    " | Anteriores al inicio: " + antesDeInicio.toLocaleString();
+    " | En N/A: " + (antesDeInicio + fechasMalas).toLocaleString() +
+    " (anteriores al inicio: " + antesDeInicio.toLocaleString() +
+    ", sin fecha válida: " + fechasMalas.toLocaleString() + ")";
   $("copiar").disabled = false;
   $("go").disabled = false;
 }
 
 $("go").onclick = procesar;
+$("incluirCeros").onchange = () => { if (datos.size) render(); };
 $("copiar").onclick = async () => {
   await navigator.clipboard.writeText(tsv);
   $("estado").textContent += " | Tabla copiada, pégala en Excel.";
